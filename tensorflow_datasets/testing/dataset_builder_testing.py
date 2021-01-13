@@ -15,6 +15,7 @@
 
 """Base DatasetBuilderTestCase to test a DatasetBuilder base class."""
 
+from absl import logging
 import collections
 import contextlib
 import difflib
@@ -29,6 +30,7 @@ from unittest import mock
 from absl.testing import parameterized
 import numpy as np
 import tensorflow.compat.v2 as tf
+import types
 
 from tensorflow_datasets.core import dataset_builder
 from tensorflow_datasets.core import dataset_info
@@ -118,6 +120,7 @@ class DatasetBuilderTestCase(
       recommended `tf.io.gfile` API.
     * SKIP_CHECKSUMS: Checks that the urls called by `dl_manager.download`
       are registered.
+    * SKIP_TF1_GRAPH_MODE: Runs in eager mode only.
 
   This test case will check for the following:
 
@@ -143,6 +146,7 @@ class DatasetBuilderTestCase(
   OVERLAPPING_SPLITS = []
   MOCK_OUT_FORBIDDEN_OS_FUNCTIONS = True
   SKIP_CHECKSUMS = False
+  SKIP_TF1_GRAPH_MODE = False
 
   @classmethod
   def setUpClass(cls):
@@ -299,6 +303,9 @@ class DatasetBuilderTestCase(
 
   @test_utils.run_in_graph_and_eager_modes()
   def test_download_and_prepare_as_dataset(self):
+    if not tf.executing_eagerly() and self.SKIP_TF1_GRAPH_MODE:
+      logging.warning("Skipping tests in non-eager mode")
+      return
     # If configs specified, ensure they are all valid
     if self.BUILDER_CONFIG_NAMES_TO_TEST:
       for config in self.BUILDER_CONFIG_NAMES_TO_TEST:  # pylint: disable=not-an-iterable
@@ -451,11 +458,12 @@ class DatasetBuilderTestCase(
     split_to_checksums = {}  # {"split": set(examples_checksums)}
     for split_name, expected_examples_number in self.SPLITS.items():
       ds = builder.as_dataset(split=split_name)
+      ds_element = next(iter(ds)) if tf.executing_eagerly() else None
       compare_shapes_and_types(
           builder.info.features.get_tensor_info(),
           tf.compat.v1.data.get_output_types(ds),
           tf.compat.v1.data.get_output_shapes(ds),
-      )
+          ds_element)
       examples = list(dataset_utils.as_numpy(
           builder.as_dataset(split=split_name)))
       split_to_checksums[split_name] = set(checksum(rec) for rec in examples)
@@ -538,6 +546,9 @@ def checksum(example):
         flat_str.append(str(list(element.ravel())))
       else:
         flat_str.append(element.tobytes())
+    elif isinstance(element, types.GeneratorType):
+      for nested_e in element:
+        _bytes_flatten(flat_str, nested_e)
     else:
       flat_str.append(bytes(element))
     return flat_str
@@ -554,12 +565,22 @@ def checksum(example):
   return hash_.hexdigest()
 
 
-def compare_shapes_and_types(tensor_info, output_types, output_shapes):
+def compare_shapes_and_types(tensor_info, output_types, output_shapes, data):
   """Compare shapes and types between TensorInfo and Dataset types/shapes."""
+  if isinstance(output_types, tf.data.DatasetSpec):
+    if tf.executing_eagerly():
+      output_types = tf.compat.v1.data.get_output_types(data)
+      output_shapes = tf.compat.v1.data.get_output_shapes(data)
+      data = next(iter(data))
+    else:
+      logging.warning(
+          "Nested datasets are not supported in graph mode in TF1.")
+      return
   for feature_name, feature_info in tensor_info.items():
     if isinstance(feature_info, dict):
+      nested_data = data[feature_name] if data else None
       compare_shapes_and_types(feature_info, output_types[feature_name],
-                               output_shapes[feature_name])
+                               output_shapes[feature_name], nested_data)
     else:
       expected_type = feature_info.dtype
       output_type = output_types[feature_name]
